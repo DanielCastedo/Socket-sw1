@@ -1,0 +1,264 @@
+import { Component, OnInit } from '@angular/core';
+import * as joint from '@joint/plus'; // JointJS Plus
+import { io } from 'socket.io-client';
+import { ActivatedRoute, Router } from '@angular/router'; // Para manejar rutas dinámicas
+
+@Component({
+  selector: 'app-diagram',
+  templateUrl: './diagram.component.html',
+  styleUrls: ['./diagram.component.css']
+})
+export class DiagramComponent implements OnInit {
+
+  private graph!: joint.dia.Graph;
+  private paper!: joint.dia.Paper;
+  private socket!: any;
+  public sessionId: string | null = null;  // Variable para almacenar la ID de la sesión
+  public sessionLink: string = '';  // Link para unirse a la sesión
+  private isUpdatingFromServer = false; // Flag para controlar si la actualización viene del servidor
+  private selectedTool: string = ''; // Para manejar la herramienta seleccionada
+  private selectedSourceClass: any = null; // Almacena la clase fuente seleccionada para una relación
+  private initialPointerPosition = { x: 0, y: 0 }; // Posición inicial del puntero cuando se hace clic en la celda
+  private initialCellPosition = { x: 0, y: 0 }; // Posición inicial de la celda seleccionada
+
+  constructor(private route: ActivatedRoute, private router: Router) {}
+
+  ngOnInit(): void {
+    // Obtener la sesión desde la URL si existe
+    this.sessionId = this.route.snapshot.paramMap.get('sessionId');
+
+    // Conectar con el servidor Socket.IO
+    this.socket = io('http://localhost:3000');
+
+    // Si hay una sesión en la URL, únete a ella
+    if (this.sessionId) {
+      console.log('Uniéndose a la sesión:', this.sessionId);
+      this.socket.emit('join-session', this.sessionId);
+    }
+
+    // Verificar la conexión al servidor
+    this.socket.on('connect', () => {
+      console.log('Conectado al servidor Socket.IO');
+    });
+
+    // Inicializar el gráfico JointJS Plus
+    this.graph = new joint.dia.Graph({}, { cellNamespace: joint.shapes });
+
+    this.paper = new joint.dia.Paper({
+      el: document.getElementById('paper-container')!,
+      model: this.graph,
+      width: 800,
+      height: 600,
+      gridSize: 10,
+      drawGrid: true,
+      background: { color: 'white' },
+      cellViewNamespace: joint.shapes
+    });
+
+    // Recibir el estado inicial de la sesión
+    this.socket.on('initialize', (initialCells: any) => {
+      console.log('Inicializando con las celdas existentes:', initialCells);
+
+      // Agregar todas las celdas del estado inicial al gráfico
+      for (const id in initialCells) {
+        let existingCell = this.graph.getCell(id);
+
+        if (!existingCell) {
+          // Crear la celda directamente en la posición correcta
+          const newCell = new joint.shapes.standard.Rectangle();
+          newCell.position(initialCells[id].x, initialCells[id].y); // Colocar en la posición correcta de inmediato
+          newCell.resize(100, 40);
+          newCell.attr({
+            body: { fill: 'blue' },
+            label: { text: 'Clase Ejemplo', fill: 'white' }
+          });
+          newCell.id = id; // Asignar el mismo ID para consistencia
+          newCell.addTo(this.graph);
+        } else {
+          // Si ya existe la celda, actualizar su posición
+          existingCell.set('position', { x: initialCells[id].x, y: initialCells[id].y });
+        }
+      }
+    });
+
+    // Capturar la posición inicial cuando se selecciona la celda
+    this.paper.on('cell:pointerdown', (cellView, evt, x, y) => {
+      const cell = cellView.model;
+      this.initialPointerPosition = { x, y }; // Guardar la posición del puntero al hacer clic
+      this.initialCellPosition = cell.position(); // Guardar la posición de la celda
+    });
+
+    // Detectar movimiento de celdas y sincronizar en tiempo real
+    this.paper.on('cell:pointermove', (cellView, evt, x, y) => {
+      if (this.isUpdatingFromServer) return; // Si la actualización proviene del servidor, no enviar el movimiento
+
+      const cell = cellView.model;
+
+      // Calcular el desplazamiento relativo
+      const dx = x - this.initialPointerPosition.x;
+      const dy = y - this.initialPointerPosition.y;
+
+      // Actualizar la celda de manera relativa desde su posición inicial
+      cell.set('position', { x: this.initialCellPosition.x + dx, y: this.initialCellPosition.y + dy });
+
+      // Emitir el cambio al servidor con el ID de la celda y la sesión
+      this.socket.emit('cell-move', { sessionId: this.sessionId, id: cell.id, x: cell.position().x, y: cell.position().y });
+    });
+
+    // Escuchar las actualizaciones desde el servidor y actualizar el gráfico
+    this.socket.on('update-cell-position', (data: any) => {
+      console.log('Actualización recibida desde el servidor:', data);
+      let cell = this.graph.getCell(data.id);
+
+      // Activar flag para indicar que la actualización proviene del servidor
+      this.isUpdatingFromServer = true;
+
+      // Si ya existe la celda, actualizarla
+      if (cell) {
+        cell.set('position', { x: data.x, y: data.y });
+      } else {
+        // Si no existe, crearla directamente en la posición correcta
+        const newCell = new joint.shapes.standard.Rectangle();
+        newCell.position(data.x, data.y);
+        newCell.resize(100, 40);
+        newCell.attr({
+          body: { fill: 'blue' },
+          label: { text: 'Clase Ejemplo', fill: 'white' }
+        });
+        newCell.id = data.id;
+        newCell.addTo(this.graph);
+      }
+
+      // Desactivar el flag después de la actualización
+      this.isUpdatingFromServer = false;
+    });
+
+    // Manejar el clic en una clase para crear una relación entre dos clases
+    this.paper.on('element:pointerclick', (elementView) => {
+      if (this.selectedTool !== 'class') {
+        if (!this.selectedSourceClass) {
+          // Selecciona la primera clase
+          this.selectedSourceClass = elementView.model;
+        } else {
+          // Selecciona la segunda clase y crea la relación
+          const targetClass = elementView.model;
+          this.createRelationship(this.selectedSourceClass, targetClass, this.selectedTool);
+          this.selectedSourceClass = null; // Reiniciar selección de clases
+        }
+      }
+    });
+
+    // Manejar el clic en la pizarra para agregar una nueva clase
+    this.paper.on('blank:pointerclick', (event, x, y) => {
+      if (this.selectedTool === 'class') {
+        // Crear una nueva clase en la posición x, y
+        const newClass = new joint.shapes.standard.Rectangle();
+        newClass.position(x, y);
+        newClass.resize(100, 40);
+        newClass.attr({
+          body: { fill: 'white' },
+          label: { text: 'Nueva Clase', fill: 'black' }
+        });
+        newClass.addTo(this.graph);
+      }
+    });
+  }
+
+  // Función para seleccionar la herramienta actual
+  selectTool(tool: string): void {
+    this.selectedTool = tool;
+  }
+
+  // Función para crear una relación entre dos clases
+  createRelationship(source: any, target: any, type: string): void {
+    let link = null;
+    let  label = ''; // El nombre de la relación (puede ser personalizado)
+
+    switch (type) {
+      case 'association':
+        link = new joint.shapes.standard.Link({
+          source: { id: source.id },
+          target: { id: target.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2 } }
+        });
+        label = 'Asociación';
+        break;
+
+      case 'composition':
+        link = new joint.shapes.standard.Link({
+          source: { id: source.id },
+          target: { id: target.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2, sourceMarker: { type: 'circle', fill: 'black' } } }
+        });
+        label = 'Composición';
+        break;
+
+      case 'aggregation':
+        link = new joint.shapes.standard.Link({
+          source: { id: source.id },
+          target: { id: target.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2, sourceMarker: { type: 'diamond', fill: 'white' } } }
+        });
+        label = 'Agregación';
+        break;
+
+      case 'inheritance':
+        link = new joint.shapes.standard.Link({
+          source: { id: source.id },
+          target: { id: target.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2, sourceMarker: { type: 'path', d: 'M 10 -5 0 0 10 5 Z', fill: 'white' } } }
+        });
+        label = 'Herencia';
+        break;
+
+      case 'manyToMany':
+        // Crear una clase intermedia y una relación muchos a muchos
+        const intermediateClass = new joint.shapes.standard.Rectangle();
+        intermediateClass.position((source.position().x + target.position().x) / 2, (source.position().y + target.position().y) / 2);
+        intermediateClass.resize(100, 40);
+        intermediateClass.attr({
+          body: { fill: 'white' },
+          label: { text: 'Intermedia', fill: 'black' }
+        });
+        intermediateClass.addTo(this.graph);
+
+        link = new joint.shapes.standard.Link({
+          source: { id: source.id },
+          target: { id: intermediateClass.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2 } }
+        });
+        const link2 = new joint.shapes.standard.Link({
+          source: { id: intermediateClass.id },
+          target: { id: target.id },
+          attrs: { line: { stroke: 'black', strokeWidth: 2 } }
+        });
+        this.graph.addCell(link2);
+        label = 'Muchos a Muchos';
+        break;
+
+      default:
+        console.log('Tipo de relación no soportada');
+        break;
+    }
+
+    if (link) {
+      // Agregar etiquetas como el nombre de la función y las cardinalidades
+      link.appendLabel({
+        attrs: {
+          text: { text: `${label}`, fill: 'black', fontSize: 12 }
+        }
+      });
+      link.addTo(this.graph);
+    }
+  }
+
+  // Función para crear una nueva sesión
+  createSession(): void {
+    this.socket.emit('create-session', (sessionId: string) => {
+      this.sessionId = sessionId;
+      this.sessionLink = `${window.location.origin}/session/${sessionId}`; // Generar el link con el sessionId
+      console.log('Sesión creada:', this.sessionLink);
+      alert(`Sesión creada: ${this.sessionLink}`);
+    });
+  }
+}

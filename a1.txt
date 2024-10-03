@@ -1,0 +1,76 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const { v4: uuidv4 } = require('uuid'); // Generar IDs únicos
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: '*',
+  }
+});
+
+let sessions = {}; // Almacenar las sesiones y sus celdas
+
+io.on('connection', (socket) => {
+  console.log('Nuevo cliente conectado');
+
+  // Crear una nueva sesión
+  socket.on('create-session', (callback) => {
+    const sessionId = uuidv4(); // Generar un ID único para la sesión
+    sessions[sessionId] = { cells: [] }; // Inicializar una nueva sesión con las celdas vacías
+    callback(sessionId); // Devolver el ID de la sesión al cliente
+  });
+
+  // Unirse a una sesión existente
+  socket.on('join-session', (sessionId) => {
+    if (!sessions[sessionId]) {
+      sessions[sessionId] = { cells: [] }; // Si no existe la sesión, crearla con las celdas vacías
+    }
+    socket.join(sessionId); // Unirse al room específico de esa sesión
+
+    // Enviar el estado actual de la sesión (todas las celdas existentes)
+    socket.emit('initialize', { cells: sessions[sessionId].cells });
+  });
+
+  // Escuchar cambios en el gráfico (pizarra)
+  socket.on('graph-changed', (data) => {
+    const { sessionId, cell } = data;
+
+    // Verificar que la sesión existe
+    if (!sessions[sessionId]) return;
+
+    // Guardar o actualizar la celda en el estado de la sesión
+    const existingCellIndex = sessions[sessionId].cells.findIndex(c => c.id === cell.id);
+
+    if (existingCellIndex !== -1) {
+      // Actualizar la celda existente
+      sessions[sessionId].cells[existingCellIndex] = cell;
+    } else {
+      // Agregar una nueva celda
+      sessions[sessionId].cells.push(cell);
+    }
+
+    // Emitir el cambio a todos los clientes en la misma sesión
+    socket.to(sessionId).emit('graph-changed', data);
+  });
+
+  // Escuchar cuando una celda se mueve en una sesión específica
+  socket.on('cell-move', (data) => {
+    const { sessionId, id, x, y } = data;
+    if (!sessions[sessionId]) return; // Verificar que la sesión existe
+    sessions[sessionId][id] = { x, y }; // Actualizar la posición en la sesión específica
+
+    // Emitir la actualización a todos los clientes en la misma sesión
+    socket.to(sessionId).emit('update-cell-position', { id, x, y });
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Cliente desconectado');
+  });
+});
+
+server.listen(3000, () => {
+  console.log('Servidor corriendo en puerto 3000');
+});

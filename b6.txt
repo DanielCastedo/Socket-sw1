@@ -1,0 +1,265 @@
+import { Component, OnInit } from '@angular/core';
+import * as joint from '@joint/plus'; // JointJS Plus
+import { io } from 'socket.io-client';
+import { ActivatedRoute, Router } from '@angular/router'; // Para manejar rutas dinámicas
+
+@Component({
+  selector: 'app-diagram',
+  templateUrl: './diagram.component.html',
+  styleUrls: ['./diagram.component.css']
+})
+export class DiagramComponent implements OnInit {
+
+  private graph!: joint.dia.Graph;
+  private paper!: joint.dia.Paper;
+  private socket!: any;
+  public sessionId: string | null = null;  // Variable para almacenar la ID de la sesión
+  public sessionLink: string = '';  // Link para unirse a la sesión
+  private isUpdatingFromServer = false; // Flag para controlar si la actualización viene del servidor
+  private selectedTool: string = ''; // Para manejar la herramienta seleccionada
+  private selectedElementView: any = null; // Para almacenar la clase seleccionada
+
+  constructor(private route: ActivatedRoute, private router: Router) {}
+
+  ngOnInit(): void {
+    this.sessionId = this.route.snapshot.paramMap.get('sessionId');
+    this.socket = io('http://localhost:3000');
+
+    if (this.sessionId) {
+      this.socket.emit('join-session', this.sessionId);
+    }
+
+    this.socket.on('connect', () => {
+      console.log('Conectado al servidor Socket.IO');
+    });
+
+    this.initializeDiagram();
+
+    this.socket.on('initialize', (initialData: any) => {
+      this.isUpdatingFromServer = true;
+
+      initialData.cells.forEach((cell: any) => {
+        const existingCell = this.graph.getCell(cell.id);
+        if (!existingCell) {
+          this.graph.addCell(cell);
+        }
+      });
+
+      this.isUpdatingFromServer = false;
+    });
+
+    this.graph.on('change', (cell: any) => {
+      if (this.isUpdatingFromServer) return;
+
+      this.socket.emit('graph-changed', {
+        cell: cell.toJSON(),
+        sessionId: this.sessionId
+      });
+    });
+
+    this.socket.on('graph-changed', (data: any) => {
+      this.isUpdatingFromServer = true;
+
+      const existingCell = this.graph.getCell(data.cell.id);
+      if (existingCell) {
+        existingCell.set(data.cell);
+      } else {
+        this.graph.addCell(data.cell);
+      }
+
+      this.isUpdatingFromServer = false;
+    });
+  }
+
+  initializeDiagram(): void {
+    this.graph = new joint.dia.Graph({}, { cellNamespace: joint.shapes });
+
+    this.paper = new joint.dia.Paper({
+      el: document.getElementById('paper-container')!,
+      model: this.graph,
+      width: 800,
+      height: 600,
+      gridSize: 10,
+      drawGrid: true,
+      background: { color: 'white' },
+      cellViewNamespace: joint.shapes
+    });
+
+    // Al hacer clic derecho en un elemento (clase)
+    this.paper.on('element:contextmenu', (elementView, evt) => {
+      evt.preventDefault(); // Prevenir el menú contextual nativo del navegador
+      this.selectedElementView = elementView;
+      this.openContextMenu(evt, elementView);
+    });
+
+    // Mantener funcionalidad de agregar clase y relación con botones
+    this.paper.on('blank:pointerclick', (event, x, y) => {
+      if (this.selectedTool === 'class') {
+        this.addClass(x, y);
+      }
+    });
+
+    this.paper.on('element:pointerclick', (elementView: joint.dia.ElementView) => {
+      if (this.selectedTool === 'association') {
+          if (!this.selectedElementView) {
+              this.selectedElementView = elementView.model;
+          } else {
+              // Convertir ambos IDs a string para evitar errores de tipo
+              const sourceId = String(this.selectedElementView.id);
+              const targetId = String(elementView.model.id);
+              this.createRelationship(sourceId, targetId);
+              this.selectedElementView = null;
+          }
+      }
+  });
+
+  }
+
+  openContextMenu(evt: any, elementView: any): void {
+    const menu = document.createElement('div');
+    menu.style.position = 'absolute';
+    menu.style.left = `${evt.clientX}px`;
+    menu.style.top = `${evt.clientY}px`;
+    menu.style.backgroundColor = 'white';
+    menu.style.border = '1px solid black';
+    menu.style.padding = '10px';
+    menu.style.zIndex = '1000';
+    menu.innerHTML = `<button id="add-cardinality">Agregar Cardinalidad</button>`;
+
+    document.body.appendChild(menu);
+
+    // Manejar el clic en "Agregar Cardinalidad"
+    document.getElementById('add-cardinality')!.addEventListener('click', () => {
+      document.body.removeChild(menu);
+      this.createTextBoxForCardinality(elementView);
+    });
+
+    // Cerrar el menú si se hace clic fuera
+    document.addEventListener('click', (e) => {
+      if (!menu.contains(e.target as Node)) {
+        if (document.body.contains(menu)) {
+          document.body.removeChild(menu);
+        }
+      }
+    }, { once: true });
+  }
+
+  createTextBoxForCardinality(elementView: any): void {
+    const textBox = document.createElement('input');
+    textBox.type = 'text';
+    textBox.style.position = 'absolute';
+    textBox.style.left = `${elementView.el.getBoundingClientRect().right + 10}px`;
+    textBox.style.top = `${elementView.el.getBoundingClientRect().top}px`;
+    textBox.style.width = '100px';
+    textBox.style.zIndex = '1000';
+
+    document.body.appendChild(textBox);
+
+    // Manejar el evento de presionar "Enter" para agregar cardinalidad
+    textBox.addEventListener('keydown', (event: KeyboardEvent) => {
+      if (event.key === 'Enter') {
+        const cardinality = textBox.value;
+        this.addCardinalityToClass(elementView, cardinality);
+        document.body.removeChild(textBox);
+      }
+    });
+
+    textBox.focus();
+  }
+
+  addCardinalityToClass(elementView: any, cardinality: string): void {
+    const currentLabel = elementView.model.attr('label/text') || 'Nueva Clase';
+    elementView.model.attr({
+      label: {
+
+        text: ` [${cardinality}] \n ${currentLabel}`
+      }
+    });
+
+    // Emitir los cambios al servidor para mantener la sincronización
+    this.socket.emit('graph-changed', {
+      cell: elementView.model.toJSON(),
+      sessionId: this.sessionId
+    });
+  }
+
+  addClass(x: number, y: number): void {
+    const newClass = new joint.shapes.standard.HeaderedRectangle({
+      position: { x, y },
+      size: { width: 200, height: 100 },
+      attrs: {
+        header: {
+          text: 'Nueva Clase', // Nombre de la clase
+          fill: '#ffffff',
+          stroke: '#000000',
+          'font-size': 14,
+          'font-weight': 'bold',
+          height: 30,
+          'stroke-width': 1,
+        },
+        body: {
+          fill: '#ffffff',
+          stroke: '#000000',
+          'stroke-width': 1
+        },
+        attributes: {
+          text: '+ propiedad1: String\n+ propiedad2: Integer', // Propiedades de la clase
+          refY: '40%', // Ajuste para que quede debajo del nombre
+          refX: '10%',
+          'font-size': 12,
+          fill: 'black',
+        },
+        methods: {
+          text: '+ metodo1(): void\n+ metodo2(param: String): Integer', // Métodos de la clase
+          refY: '70%', // Ajuste para que quede debajo de las propiedades
+          refX: '10%',
+          'font-size': 12,
+          fill: 'black',
+        }
+      }
+    });
+
+    // Añadir la clase al gráfico
+    this.graph.addCell(newClass);
+
+    // Emitir los cambios al servidor para mantener la sincronización
+    this.socket.emit('graph-changed', {
+      cell: newClass.toJSON(),
+      sessionId: this.sessionId
+    });
+  }
+
+
+
+  createRelationship(sourceId: string, targetId: string): void {
+    const link = new joint.shapes.standard.Link({
+      source: { id: sourceId },
+      target: { id: targetId },
+      router: { name: 'orthogonal' },
+      connector: { name: 'rounded' },
+      attrs: {
+        line: { stroke: 'black', strokeWidth: 2 }
+      }
+    });
+
+    link.addTo(this.graph);
+
+    this.socket.emit('graph-changed', {
+      cell: link.toJSON(),
+      sessionId: this.sessionId
+    });
+  }
+
+  selectTool(tool: string): void {
+    this.selectedTool = tool;
+  }
+
+  createSession(): void {
+    this.socket.emit('create-session', (sessionId: string) => {
+      this.sessionId = sessionId;
+      this.sessionLink = `${window.location.origin}/session/${sessionId}`; // Generar el link con el sessionId
+      console.log('Sesión creada:', this.sessionLink);
+      alert(`Sesión creada: ${this.sessionLink}`);
+    });
+  }
+}

@@ -1,0 +1,384 @@
+import { Component, OnInit } from '@angular/core';
+import * as joint from '@joint/plus'; // JointJS Plus
+import { io } from 'socket.io-client';
+import { ActivatedRoute, Router } from '@angular/router'; // Para manejar rutas dinámicas
+
+@Component({
+  selector: 'app-diagram',
+  templateUrl: './diagram.component.html',
+  styleUrls: ['./diagram.component.css']
+})
+export class DiagramComponent implements OnInit {
+
+  private graph!: joint.dia.Graph;
+  private paper!: joint.dia.Paper;
+  private socket!: any;
+  public sessionId: string | null = null;  // Variable para almacenar la ID de la sesión
+  public sessionLink: string = '';  // Link para unirse a la sesión
+  private isUpdatingFromServer = false; // Flag para controlar si la actualización viene del servidor
+  private selectedTool: string = ''; // Para manejar la herramienta seleccionada
+  private selectedSourceClass: any = null; // Almacenar la clase fuente seleccionada para una relación
+  private selectedTargetClass: any = null; // Almacenar la clase destino seleccionada para una relación
+
+  // Agregamos las propiedades iniciales de posición
+  private initialPointerPosition = { x: 0, y: 0 }; // Posición inicial del puntero
+  private initialCellPosition = { x: 0, y: 0 }; // Posición inicial de la celda seleccionada
+  private contextMenu: HTMLElement | null = null; // Elemento para el menú contextual
+
+  constructor(private route: ActivatedRoute, private router: Router) {}
+
+  ngOnInit(): void {
+    // Obtener la sesión desde la URL si existe
+    this.sessionId = this.route.snapshot.paramMap.get('sessionId');
+
+    // Conectar con el servidor Socket.IO
+    this.socket = io('http://localhost:3000');
+
+    // Si hay una sesión en la URL, únete a ella
+    if (this.sessionId) {
+      console.log('Uniéndose a la sesión:', this.sessionId);
+      this.socket.emit('join-session', this.sessionId);
+    }
+
+    // Verificar la conexión al servidor
+    this.socket.on('connect', () => {
+      console.log('Conectado al servidor Socket.IO');
+    });
+
+    // Inicializar el gráfico JointJS Plus
+    this.graph = new joint.dia.Graph({}, { cellNamespace: joint.shapes });
+
+    this.paper = new joint.dia.Paper({
+      el: document.getElementById('paper-container')!,
+      model: this.graph,
+      width: 800,
+      height: 600,
+      gridSize: 10,
+      drawGrid: true,
+      background: { color: 'white' },
+      cellViewNamespace: joint.shapes
+    });
+
+    // Recibir el estado inicial de la sesión
+    this.socket.on('initialize', (initialData: any) => {
+      this.isUpdatingFromServer = true;
+
+      // Agregar todas las celdas al gráfico
+      initialData.cells.forEach((cellData: any) => {
+        const cell = this.graph.getCell(cellData.id);
+
+        if (!cell) {
+          this.graph.addCell(cellData);
+        }
+
+        const existingCell = this.graph.getCell(cellData.id);
+
+        // Restaurar el texto asociado si existe el `associatedTextId`
+        if (cellData.attrs && cellData.attrs.associatedTextId) {
+          const associatedText = this.graph.getCell(cellData.attrs.associatedTextId);
+
+          if (associatedText && associatedText.isElement()) {
+            // Obtener el tamaño de la celda principal
+            const bbox = existingCell.getBBox();
+            // Obtener el tamaño del texto asociado
+            const textBBox = associatedText.getBBox();
+
+            // Posicionar el texto centrado debajo de la clase
+            (associatedText as joint.dia.Element).position(
+              bbox.x + bbox.width / 2 - textBBox.width / 2,
+              bbox.y + bbox.height + 15
+            );
+
+            // Vincular el movimiento del texto con el movimiento de la clase
+            existingCell.on('change:position', () => {
+              const newBBox = existingCell.getBBox();
+              associatedText.position(newBBox.x + newBBox.width / 2 - textBBox.width / 2, newBBox.y + newBBox.height + 15);
+
+              // Emitir el cambio de posición del texto al servidor
+              this.socket.emit('graph-changed', {
+                cell: associatedText.toJSON(),
+                sessionId: this.sessionId
+              });
+            });
+          }
+        }
+      });
+
+      this.isUpdatingFromServer = false;
+    });
+
+    // Detectar cambios en el gráfico (cualquier cambio) y emitir al servidor
+    this.graph.on('change', (cell: any) => {
+      if (this.isUpdatingFromServer) return;
+
+      // Emitir los cambios al servidor
+      this.socket.emit('graph-changed', {
+        cell: cell.toJSON(),
+        sessionId: this.sessionId
+      });
+    });
+
+    // Escuchar las actualizaciones desde el servidor
+    this.socket.on('graph-changed', (data: any) => {
+      this.isUpdatingFromServer = true;
+
+      const existingCell = this.graph.getCell(data.cell.id);
+
+      if (existingCell) {
+        // Si la celda ya existe, actualizar sus atributos
+        existingCell.set(data.cell);
+      } else {
+        // Si no existe, agregarla al gráfico
+        this.graph.addCell(data.cell);
+      }
+
+      this.isUpdatingFromServer = false;
+    });
+
+    // Capturar la posición inicial cuando se selecciona la celda
+    this.paper.on('cell:pointerdown', (cellView, evt, x, y) => {
+      const cell = cellView.model;
+      this.initialPointerPosition = { x, y }; // Guardar la posición del puntero al hacer clic
+      this.initialCellPosition = cell.position(); // Guardar la posición de la celda
+    });
+
+    // Detectar movimiento de celdas y sincronizar en tiempo real
+    this.paper.on('cell:pointermove', (cellView, evt, x, y) => {
+      if (this.isUpdatingFromServer) return; // Si la actualización proviene del servidor, no enviar el movimiento
+
+      const cell = cellView.model;
+
+      // Calcular el desplazamiento relativo
+      const dx = x - this.initialPointerPosition.x;
+      const dy = y - this.initialPointerPosition.y;
+
+      // Actualizar la celda de manera relativa desde su posición inicial
+      cell.set('position', { x: this.initialCellPosition.x + dx, y: this.initialCellPosition.y + dy });
+
+      // Emitir el cambio al servidor con el ID de la celda y la sesión
+      this.socket.emit('graph-changed', {
+        cell: cell.toJSON(),
+        sessionId: this.sessionId
+      });
+    });
+
+    // Manejar el clic en una clase para crear una relación entre dos clases
+    this.paper.on('element:pointerclick', (elementView) => {
+      if (this.selectedTool === 'association') {
+        if (!this.selectedSourceClass) {
+          this.selectedSourceClass = elementView.model;
+        } else {
+          this.selectedTargetClass = elementView.model;
+          this.createRelationship(this.selectedSourceClass.id, this.selectedTargetClass.id, 'association');
+          this.selectedSourceClass = null;
+          this.selectedTargetClass = null;
+        }
+      }
+    });
+
+    // Menú contextual para agregar cardinalidad
+    this.paper.on('element:contextmenu', (elementView, evt, x, y) => {
+      const domEvent = evt.originalEvent as MouseEvent; // Obtener el evento original del DOM
+      domEvent.preventDefault(); // Prevenir el menú contextual por defecto del navegador
+      this.showContextMenu(domEvent, elementView.model, x, y);
+    });
+
+    // Manejar el clic en la pizarra para agregar una nueva clase
+    this.paper.on('blank:pointerclick', (event, x, y) => {
+      if (this.selectedTool === 'class') {
+        // Crear una nueva clase en la posición x, y
+        const newClass = new joint.shapes.standard.Rectangle();
+        newClass.position(x, y);
+        newClass.resize(100, 40);
+        newClass.attr({
+          body: { fill: 'white' },
+          label: { text: 'Nueva Clase', fill: 'black' }
+        });
+        newClass.addTo(this.graph);
+
+        // Emitir la creación de la nueva clase al servidor
+        this.socket.emit('graph-changed', {
+          cell: newClass.toJSON(),
+          sessionId: this.sessionId
+        });
+      }
+    });
+
+    // Crear el menú contextual
+    this.contextMenu = document.createElement('div');
+    this.contextMenu.id = 'context-menu';
+    this.contextMenu.style.position = 'absolute';
+    this.contextMenu.style.display = 'none';
+    this.contextMenu.style.backgroundColor = '#ffffff';
+    this.contextMenu.style.border = '1px solid #ccc';
+    this.contextMenu.style.padding = '10px';
+    this.contextMenu.innerHTML = `
+      <ul style="list-style: none; padding: 0; margin: 0;">
+        <li id="add-cardinality" style="cursor: pointer; padding: 5px;">Agregar cardinalidad</li>
+        <li id="remove-class" style="cursor: pointer; padding: 5px;">Eliminar clase</li>
+      </ul>
+    `;
+    document.body.appendChild(this.contextMenu);
+
+    // Agregar eventos a las opciones del menú
+    document.getElementById('add-cardinality')!.addEventListener('click', () => {
+      this.addCardinalityToClass(this.selectedSourceClass);
+      this.hideContextMenu();
+    });
+
+    document.getElementById('remove-class')!.addEventListener('click', () => {
+      if (this.selectedSourceClass) {
+        this.graph.getCell(this.selectedSourceClass.id).remove();
+        this.socket.emit('graph-changed', {
+          cell: this.selectedSourceClass.toJSON(),
+          sessionId: this.sessionId
+        });
+      }
+      this.hideContextMenu();
+    });
+
+    // Ocultar el menú al hacer clic fuera
+    document.addEventListener('click', (event) => {
+      if (this.contextMenu && event.target !== this.contextMenu) {
+        this.hideContextMenu();
+      }
+    });
+  }
+
+  // Mostrar el menú contextual
+  showContextMenu(evt: MouseEvent, element: any, x: number, y: number): void {
+    this.selectedSourceClass = element;
+
+    if (this.contextMenu) {
+      this.contextMenu.style.display = 'block';
+      this.contextMenu.style.left = `${evt.clientX}px`;
+      this.contextMenu.style.top = `${evt.clientY}px`;
+    }
+  }
+
+  // Ocultar el menú contextual
+  hideContextMenu(): void {
+    if (this.contextMenu) {
+      this.contextMenu.style.display = 'none';
+    }
+  }
+
+  addCardinalityToClass(element: any): void {
+    const bbox = element.getBBox();
+    const clientX = bbox.x + bbox.width / 2; // Centrar el texto debajo de la clase
+    const clientY = bbox.y + bbox.height + 10; // Posicionar debajo de la clase
+
+    // Crear el cuadro de texto emergente al lado de la clase
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = ''; // Inicia sin texto para que se ingrese el valor
+    input.style.position = 'absolute';
+    input.style.left = `${clientX - 25}px`; // Centrar el cuadro de texto respecto a la clase
+    input.style.top = `${clientY}px`;
+    input.style.width = '50px';
+    input.style.zIndex = '1000';
+    input.style.fontSize = '12px';
+
+    document.body.appendChild(input);
+
+    // Función para manejar el evento cuando se presiona "Enter"
+    input.addEventListener('keydown', (event: KeyboardEvent) => {
+      if (event.key === 'Enter') {
+        const newText = input.value;
+        document.body.removeChild(input);
+
+        // Crear una etiqueta separada debajo de la clase
+        const textLabel = new joint.shapes.standard.TextBlock();
+        const textWidth = newText.length * 7 + 10; // Ajustar el ancho del texto en función del contenido
+        textLabel.position(bbox.x + bbox.width / 2 - textWidth / 2, bbox.y + bbox.height + 15); // Posicionar debajo de la clase
+        textLabel.resize(textWidth, 20);
+
+        textLabel.attr({
+          body: { fill: 'white', stroke: 'none' },  // Fondo blanco y sin borde
+          label: { text: newText, fill: 'black', fontSize: 12 }
+        });
+
+        this.graph.addCell(textLabel);
+
+        // Vincular el texto a la clase para que se mueva en tiempo real
+        element.set('attrs/associatedTextId', textLabel.id); // Guardar el associatedTextId en los atributos de la clase
+
+        // Emitir los cambios de la clase y el texto al servidor
+        this.socket.emit('graph-changed', {
+          cell: element.toJSON(),
+          sessionId: this.sessionId
+        });
+        this.socket.emit('graph-changed', {
+          cell: textLabel.toJSON(),
+          sessionId: this.sessionId
+        });
+
+        // Vincular el movimiento del texto con el movimiento de la clase
+        element.on('change:position', () => {
+          const newBBox = element.getBBox();
+          textLabel.position(newBBox.x + newBBox.width / 2 - textWidth / 2, newBBox.y + newBBox.height + 15);
+
+          // Emitir el cambio de posición del texto al servidor para mantener la sincronización
+          this.socket.emit('graph-changed', {
+            cell: textLabel.toJSON(),
+            sessionId: this.sessionId
+          });
+        });
+      }
+    });
+
+    input.focus();
+  }
+
+  // Función para seleccionar la herramienta actual (relación o clase)
+  selectTool(tool: string): void {
+    this.selectedTool = tool;
+  }
+
+  // Función para crear una relación entre dos clases
+  createRelationship(sourceId: any, targetId: any, type: string, label?: string): void {
+    let link = null;
+
+    switch (type) {
+      case 'association':
+        link = new joint.shapes.standard.Link({
+          source: { id: sourceId },
+          target: { id: targetId },
+          router: { name: 'orthogonal' },  // Usa el router ortogonal para mantener las líneas rectas
+          connector: { name: 'rounded' },  // Puedes usar 'normal' o 'rounded' para los bordes de las flechas
+          attrs: {
+            line: { stroke: 'black', strokeWidth: 2 },
+            label: { text: '', fill: 'black' }  // Elimina el texto por defecto
+          }
+        });
+        label = label || '';
+        break;
+
+      // Aquí puedes añadir más tipos de relaciones (composición, agregación, etc.)
+
+      default:
+        console.log('Tipo de relación no soportada');
+        break;
+    }
+
+    if (link) {
+      link.addTo(this.graph);
+
+      // Emitir la creación de la relación al servidor
+      this.socket.emit('graph-changed', {
+        cell: link.toJSON(),
+        sessionId: this.sessionId
+      });
+    }
+  }
+
+  // Función para crear una nueva sesión
+  createSession(): void {
+    this.socket.emit('create-session', (sessionId: string) => {
+      this.sessionId = sessionId;
+      this.sessionLink = `${window.location.origin}/session/${sessionId}`; // Generar el link con el sessionId
+      console.log('Sesión creada:', this.sessionLink);
+      alert(`Sesión creada: ${this.sessionLink}`);
+    });
+  }
+}

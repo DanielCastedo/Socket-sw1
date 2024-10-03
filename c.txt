@@ -1,0 +1,179 @@
+import { AfterViewInit, OnInit, Component, ElementRef, ViewChild } from '@angular/core';
+import { dia, shapes, ui } from '@joint/plus';
+
+@Component({
+  selector: 'app-root',
+  templateUrl: './app.component.html',
+  styleUrls: ['./app.component.css']
+})
+export class AppComponent implements OnInit, AfterViewInit {
+  @ViewChild('canvas', { static: true }) canvas: ElementRef;
+
+  private graph: dia.Graph;
+  private paper: dia.Paper;
+
+  ngOnInit(): void {
+    // Inicializar el gráfico
+    this.graph = new dia.Graph({}, { cellNamespace: shapes });
+
+    // Inicializar el paper y configurar interacciones
+    this.paper = new dia.Paper({
+      model: this.graph,
+      width: 800,
+      height: 600,
+      gridSize: 10,
+      drawGrid: true,  // Cuadrícula visible
+      async: true, // Procesamiento asíncrono
+      cellViewNamespace: shapes,
+      interactive: {
+        linkMove: false  // Desactivar el movimiento de enlaces
+      },
+      background: { color: 'white' }  // Fondo blanco
+    });
+
+    // Crear un rectángulo (clase)
+    const rect = new shapes.standard.Rectangle({
+      position: { x: 50, y: 50 },
+      size: { width: 120, height: 80 },
+      attrs: {
+        label: {
+          text: 'Clase A',
+          fill: 'white',
+          fontSize: 20,
+          fontFamily: 'Montserrat',
+          fontWeight: 'normal'
+        },
+        body: {
+          fill: '#31D0C6',
+          stroke: '#4B4A67',
+          strokeWidth: 2
+        }
+      }
+    });
+
+    // Crear un elipse (otra clase)
+    const ellipse = new shapes.standard.Ellipse({
+      position: { x: 350, y: 200 },
+      size: { width: 80, height: 80 },
+      attrs: {
+        label: {
+          text: 'Clase B',
+          fill: '#4b4a67',
+          fontSize: 18,
+          fontFamily: 'Montserrat'
+        },
+        body: {
+          fill: '#fe854f',
+          stroke: 'none'
+        }
+      }
+    });
+
+    // Agregar las figuras al gráfico
+    this.graph.addCells([rect, ellipse]);
+
+    // Habilitar edición de texto en los elementos y enlaces
+    this.enableTextEditing();
+
+    // Mostrar las herramientas (Halo) cuando se haga clic en el rectángulo o la elipse
+    this.paper.on('element:pointerclick', (elementView) => {
+      const halo = new ui.Halo({ cellView: elementView });
+      this.customizeHalo(halo); // Personalizar el Halo
+      halo.render();
+    });
+
+    // Escuchar cuando se conecta una relación (enlace) usando las herramientas del Halo
+    this.paper.on('link:connect', (linkView) => {
+      // Agregar automáticamente dos labels editables cuando se conecta un enlace
+      linkView.model.appendLabel({
+        position: 0.1,  // Colocar la primera etiqueta cerca del origen
+        attrs: {
+          text: {
+            text: 'Etiqueta 1',  // Texto predeterminado para la primera etiqueta
+            pointerEvents: 'auto',  // Permitir que sea editable
+            cursor: 'text'
+          }
+        }
+      });
+
+      linkView.model.appendLabel({
+        position: 0.9,  // Colocar la segunda etiqueta cerca del destino
+        attrs: {
+          text: {
+            text: 'Etiqueta 2',  // Texto predeterminado para la segunda etiqueta
+            pointerEvents: 'auto',  // Permitir que sea editable
+            cursor: 'text'
+          }
+        }
+      });
+
+      // Habilitar la edición de las etiquetas al hacer doble clic en ellas
+      this.enableTextEditingForLink(linkView);
+    });
+  }
+
+  ngAfterViewInit(): void {
+    // Insertar el papel en el contenedor del DOM (canvas)
+    this.canvas.nativeElement.appendChild(this.paper.el);
+  }
+
+  // Función para habilitar la edición de texto en las etiquetas de los enlaces y elementos
+  private enableTextEditing(): void {
+    // Editar etiquetas en los elementos (rectángulos, elipses, etc.)
+    this.paper.on('element:pointerdblclick', (elementView, evt) => {
+      ui.TextEditor.edit(evt.target, {
+        cellView: elementView,
+        textProperty: ['attrs', 'label', 'text'],
+        annotationsProperty: ['attrs', 'label', 'annotations']
+      });
+    });
+
+    // Editar etiquetas en los enlaces al hacer doble clic
+    this.paper.on('link:pointerdblclick', (linkView, evt) => {
+      const index = Number(linkView.findAttribute('label-idx', evt.target));
+      ui.TextEditor.edit(evt.target, {
+        cellView: linkView,
+        textProperty: ['labels', index, 'attrs', 'text', 'text'],
+        annotationsProperty: ['labels', index, 'attrs', 'text', 'annotations']
+      });
+    });
+
+    // Cerrar el editor de texto al hacer clic en el fondo
+    this.paper.on('blank:pointerdown', () => {
+      ui.TextEditor.close();
+    });
+  }
+
+  // Función específica para habilitar la edición en los enlaces creados por el Halo
+  private enableTextEditingForLink(linkView: dia.LinkView): void {
+    linkView.on('label:pointerdblclick', (evt, index) => {
+      ui.TextEditor.edit(evt.target, {
+        cellView: linkView,
+        textProperty: ['labels', index, 'attrs', 'text', 'text'],
+        annotationsProperty: ['labels', index, 'attrs', 'text', 'annotations']
+      });
+    });
+  }
+
+  // Función para personalizar el Halo (las herramientas que aparecen al hacer clic en el elemento)
+  private customizeHalo(halo: ui.Halo): void {
+    halo.addHandle({
+      name: 'myaction',
+      position: 's' as ui.Halo.HandlePosition,  // Posición sur
+      icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAARCQAAEQkBwOWiGAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAU4SURBVFiFrZdraBxVFMd/Z2aTbmvWVVs1xmoNseKjps3M3aTEqGyrgo9K8a0fVHyUIqL4QkSxKFSoBhRFEaxaLVZaQbH1g7ZIg8Y2dGcTIhXR2iLWF7'  // Icono para el handle
+    });
+
+    halo.changeHandle('clone', {
+      name: 'clone',  // Asegúrate de incluir el "name"
+      position: 'se' as ui.Halo.HandlePosition  // Posición sureste
+    });
+
+    halo.removeHandle('resize');  // Remover el handle de redimensionar
+
+    // Acción personalizada al hacer clic en el handle personalizado
+    halo.on('action:myaction:pointerdown', (evt) => {
+      evt.stopPropagation();
+      alert('My custom action.');
+    });
+  }
+}

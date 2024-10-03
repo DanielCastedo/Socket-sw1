@@ -1,0 +1,285 @@
+import { Component, OnInit } from '@angular/core';
+import * as joint from '@joint/plus'; // JointJS Plus
+import { io } from 'socket.io-client';
+import { ActivatedRoute, Router } from '@angular/router'; // Para manejar rutas dinámicas
+
+@Component({
+  selector: 'app-diagram',
+  templateUrl: './diagram.component.html',
+  styleUrls: ['./diagram.component.css']
+})
+export class DiagramComponent implements OnInit {
+
+  private graph!: joint.dia.Graph;
+  private paper!: joint.dia.Paper;
+  private socket!: any;
+  public sessionId: string | null = null;  // Variable para almacenar la ID de la sesión
+  public sessionLink: string = '';  // Link para unirse a la sesión
+  private isUpdatingFromServer = false; // Flag para controlar si la actualización viene del servidor
+  private selectedTool: string = ''; // Para manejar la herramienta seleccionada
+  private selectedSourceClass: any = null; // Almacenar la clase fuente seleccionada para una relación
+  private initialPointerPosition = { x: 0, y: 0 }; // Posición inicial del puntero cuando se hace clic en la celda
+  private initialCellPosition = { x: 0, y: 0 }; // Posición inicial de la celda seleccionada
+
+  constructor(private route: ActivatedRoute, private router: Router) {}
+
+  ngOnInit(): void {
+    // Obtener la sesión desde la URL si existe
+    this.sessionId = this.route.snapshot.paramMap.get('sessionId');
+
+    // Conectar con el servidor Socket.IO
+    this.socket = io('http://localhost:3000');
+
+    // Si hay una sesión en la URL, únete a ella
+    if (this.sessionId) {
+      console.log('Uniéndose a la sesión:', this.sessionId);
+      this.socket.emit('join-session', this.sessionId);
+    }
+
+    // Verificar la conexión al servidor
+    this.socket.on('connect', () => {
+      console.log('Conectado al servidor Socket.IO');
+    });
+
+    // Inicializar el gráfico JointJS Plus
+    this.graph = new joint.dia.Graph({}, { cellNamespace: joint.shapes });
+
+    this.paper = new joint.dia.Paper({
+      el: document.getElementById('paper-container')!,
+      model: this.graph,
+      width: 800,
+      height: 600,
+      gridSize: 10,
+      drawGrid: true,
+      background: { color: 'white' },
+      cellViewNamespace: joint.shapes
+    });
+
+    // Recibir el estado inicial de la sesión
+    this.socket.on('initialize', (initialData: any) => {
+      this.isUpdatingFromServer = true;
+
+      // Agregar todas las celdas al gráfico
+      initialData.cells.forEach((cell: any) => {
+        const existingCell = this.graph.getCell(cell.id);
+        if (!existingCell) {
+          this.graph.addCell(cell);
+        }
+      });
+
+      this.isUpdatingFromServer = false;
+    });
+
+    // Detectar cambios en el gráfico (cualquier cambio) y emitir al servidor
+    this.graph.on('change', (cell: any) => {
+      if (this.isUpdatingFromServer) return;
+
+      // Emitir los cambios al servidor
+      this.socket.emit('graph-changed', {
+        cell: cell.toJSON(),
+        sessionId: this.sessionId
+      });
+    });
+
+    // Escuchar las actualizaciones desde el servidor
+    this.socket.on('graph-changed', (data: any) => {
+      this.isUpdatingFromServer = true;
+
+      const existingCell = this.graph.getCell(data.cell.id);
+
+      if (existingCell) {
+        // Si la celda ya existe, actualizar sus atributos
+        existingCell.set(data.cell);
+      } else {
+        // Si no existe, agregarla al gráfico
+        this.graph.addCell(data.cell);
+      }
+
+      this.isUpdatingFromServer = false;
+    });
+
+    // Capturar la posición inicial cuando se selecciona la celda
+    this.paper.on('cell:pointerdown', (cellView, evt, x, y) => {
+      const cell = cellView.model;
+      this.initialPointerPosition = { x, y }; // Guardar la posición del puntero al hacer clic
+      this.initialCellPosition = cell.position(); // Guardar la posición de la celda
+    });
+
+    // Detectar movimiento de celdas y sincronizar en tiempo real
+    this.paper.on('cell:pointermove', (cellView, evt, x, y) => {
+      if (this.isUpdatingFromServer) return; // Si la actualización proviene del servidor, no enviar el movimiento
+
+      const cell = cellView.model;
+
+      // Calcular el desplazamiento relativo
+      const dx = x - this.initialPointerPosition.x;
+      const dy = y - this.initialPointerPosition.y;
+
+      // Actualizar la celda de manera relativa desde su posición inicial
+      cell.set('position', { x: this.initialCellPosition.x + dx, y: this.initialCellPosition.y + dy });
+
+      // Emitir el cambio al servidor con el ID de la celda y la sesión
+      this.socket.emit('graph-changed', {
+        cell: cell.toJSON(),
+        sessionId: this.sessionId
+      });
+    });
+
+    // Manejar el clic en una clase para crear una relación entre dos clases
+    this.paper.on('element:pointerclick', (elementView) => {
+      if (this.selectedTool !== 'class' && this.selectedTool !== '') {
+        if (!this.selectedSourceClass) {
+          // Selecciona la primera clase (origen)
+          this.selectedSourceClass = elementView.model;
+        } else {
+          // Selecciona la segunda clase (destino) y crea la relación
+          const targetClass = elementView.model;
+          this.createRelationship(this.selectedSourceClass.id, targetClass.id, this.selectedTool);
+          this.selectedSourceClass = null; // Reiniciar la selección
+        }
+      }
+    });
+
+    // Manejar clic en enlaces para agregar etiquetas en diferentes posiciones
+    this.paper.on('link:pointerclick', (linkView, evt) => {
+      const link = linkView.model;
+
+      // Obtener las coordenadas del clic
+      const clientX = evt.clientX ?? 0; // Proporciona 0 si clientX es undefined
+      const clientY = evt.clientY ?? 0; // Proporciona 0 si clientY es undefined
+
+      // Crear el cuadro de texto (input) en la posición de la etiqueta
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = ''; // Inicia sin texto para que se ingrese el valor
+      input.style.position = 'absolute';
+      input.style.left = `${clientX - 25}px`; // Ajustar la posición a la izquierda para centrar
+      input.style.top = `${clientY - 10}px`; // Ajustar la posición hacia arriba
+      input.style.width = '50px'; // Ancho del input
+      input.style.zIndex = '1000'; // Asegurar que esté encima de otros elementos
+      input.style.fontSize = '12px'; // Ajustar tamaño de texto
+
+      document.body.appendChild(input);
+
+      // Función para manejar el evento cuando se presiona "Enter"
+      input.addEventListener('keydown', (event: KeyboardEvent) => {
+        if (event.key === 'Enter') {
+          const newText = input.value;
+
+          // Verificar en qué parte del enlace se va a añadir la etiqueta
+          const labelPosition = prompt(
+            'Escribe "inicio", "medio" o "final" para posicionar la etiqueta:',
+            'medio'
+          );
+
+          // Usamos porcentajes para posicionar correctamente las etiquetas
+          let position = 0.5; // Por defecto, coloca en el medio
+          if (labelPosition === 'inicio') {
+            position = 0.16; // Primer tercio de la línea
+          } else if (labelPosition === 'final') {
+            position = 0.84; // Último tercio de la línea
+          }
+
+          // Agregar la etiqueta en la posición especificada
+          link.appendLabel({
+            position: position,
+            attrs: {
+              text: {
+                text: newText,
+                fill: 'black',
+                fontSize: 12
+              }
+            }
+          });
+
+          // Eliminar el cuadro de texto del DOM
+          document.body.removeChild(input);
+
+          // Emitir el cambio al servidor
+          this.socket.emit('graph-changed', {
+            cell: link.toJSON(),
+            sessionId: this.sessionId
+          });
+        }
+      });
+
+      // Enfocar el input automáticamente
+      input.focus();
+    });
+
+
+    // Manejar el clic en la pizarra para agregar una nueva clase
+    this.paper.on('blank:pointerclick', (event, x, y) => {
+      if (this.selectedTool === 'class') {
+        // Crear una nueva clase en la posición x, y
+        const newClass = new joint.shapes.standard.Rectangle();
+        newClass.position(x, y);
+        newClass.resize(100, 40);
+        newClass.attr({
+          body: { fill: 'white' },
+          label: { text: 'Nueva Clase', fill: 'black' }
+        });
+        newClass.addTo(this.graph);
+
+        // Emitir la creación de la nueva clase al servidor
+        this.socket.emit('graph-changed', {
+          cell: newClass.toJSON(),
+          sessionId: this.sessionId
+        });
+      }
+    });
+
+  }
+
+  // Función para seleccionar la herramienta actual (relación o clase)
+  selectTool(tool: string): void {
+    this.selectedTool = tool;
+  }
+
+  // Función para crear una relación entre dos clases
+  createRelationship(sourceId: any, targetId: any, type: string, label?: string): void {
+    let link = null;
+
+    switch (type) {
+      case 'association':
+        link = new joint.shapes.standard.Link({
+          source: { id: sourceId },
+          target: { id: targetId },
+          router: { name: 'orthogonal' },  // Usa el router ortogonal para mantener las líneas rectas
+          connector: { name: 'rounded' },  // Puedes usar 'normal' o 'rounded' para los bordes de las flechas
+          attrs: {
+            line: { stroke: 'black', strokeWidth: 2 },
+            label: { text: '', fill: 'black' }  // Elimina el texto por defecto
+          }
+        });
+        label = label || '';
+        break;
+
+      // Aquí puedes añadir más tipos de relaciones (composición, agregación, etc.)
+
+      default:
+        console.log('Tipo de relación no soportada');
+        break;
+    }
+
+    if (link) {
+      link.addTo(this.graph);
+
+      // Emitir la creación de la relación al servidor
+      this.socket.emit('graph-changed', {
+        cell: link.toJSON(),
+        sessionId: this.sessionId
+      });
+    }
+  }
+
+  // Función para crear una nueva sesión
+  createSession(): void {
+    this.socket.emit('create-session', (sessionId: string) => {
+      this.sessionId = sessionId;
+      this.sessionLink = `${window.location.origin}/session/${sessionId}`; // Generar el link con el sessionId
+      console.log('Sesión creada:', this.sessionLink);
+      alert(`Sesión creada: ${this.sessionLink}`);
+    });
+  }
+}
